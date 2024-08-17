@@ -1,0 +1,6 @@
+*-checkpoint.py
+/Jupyter/Ignore
+Jupyter/local*
+/Jupyter/.ipynb_checkpoints
+Jupyter/grocyproducts.json
+/Jupyter/__pycache__
