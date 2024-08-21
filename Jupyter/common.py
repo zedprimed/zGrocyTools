@@ -8,9 +8,10 @@ class GrConf:
         config=json.load(env)
         env.close()
         #class decs
-        self.apikey = config['APIKey']
-        self.entrypoint = config['URL Root']
-        self.objects = config['Endpoints']['Objects']
+        self.apikey = config['LocalUser']['APIKey']
+        self.entrypoint = config['LocalUser']['URL Root']
+        self.objects = config['Readpoints']['Objects']
+        self.tz = config['LocalUser']['Timezone']
 
 # Create class for API calls
 class GrGetAPI:
