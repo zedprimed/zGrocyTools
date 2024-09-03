@@ -8,6 +8,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.auth.exceptions import RefreshError
 
 import google.auth
 
@@ -25,10 +26,11 @@ class GrConf:
         global CONF
         CONF = self
 
-# Create class for API calls
+# Create class for Get API calls
 class GrGetAPI:
     def __init__(self,category,obj):
-        self.endpoint = CONF.entrypoint+CONF.interface[category][obj]['path']
+        self.origEndpoint = CONF.entrypoint+CONF.interface[category][obj]['path']
+        self.endpoint = self.origEndpoint #assume generally object gets until told otherwise by buildTx
         self.key = CONF.apikey
         self.headers = {
             "accept": "application/json",
@@ -38,22 +40,61 @@ class GrGetAPI:
         self.reference = CONF.interface[category][obj]
     def buildParam(self,*query):
         for x in query:
-            #param is in Grocy query statements
+            #param is in Grocy query statements (str)
             self.params['query[]'] = x
     def buildFreeParam(self,param):
         #param is in request Dict
         self.params.update(param)
+
+    def buildTx(self,target,tx):
+        #simpler Tx builder for the Tx type gets
+        if 'txType' in self.reference and (tx=="" or target==""):
+            print("Not enough info for this type of post")
+        elif 'txType' in self.reference:
+            self.endpoint = self.origEndpoint+str(target)+'/'+tx
+        else:
+            self.endpoint = self.origEndpoint #rebuild lost endpoints for simple objects
+        self.body = body
+        
     def get(self):
         if bool(self.reference['get']):
             self.r = requests.get(self.endpoint,headers=self.headers,params=self.params)
         else:
             self.r = "Failure: get not enabled for this API"
 
+# Create class for Post API calls
+class GrPostAPI:
+    def __init__(self,category,obj):
+        self.key = CONF.apikey
+        self.headers = {
+            "accept": "application/json",
+            "GROCY-API-KEY": self.key,
+            'Content-Type': 'application/json'
+        }
+        self.r = 0
+        self.body = {}
+        self.origEndpoint = CONF.entrypoint+CONF.interface[category][obj]['path']
+        self.reference = CONF.interface[category][obj]
+    def buildTx(self,body,target="",tx=""):
+        if 'txType' in self.reference and (tx=="" or target==""):
+            print("Not enough info for this type of post")
+            #del the endpoint to stop from trying to post a malformed call after an earlier one that worked
+            del self.endpoint
+        elif 'txType' in self.reference:
+            self.endpoint = self.origEndpoint+str(target)+'/'+tx
+        else:
+            self.endpoint = self.origEndpoint
+        self.body = body
+
+    def post(self):
+        self.r = requests.post(self.endpoint,headers=self.headers,json=self.body)
+
 # Create a function for timezone handling of pandas series
+# Localize a series into default timezone
 def tz(series):
-    series = pd.to_datetime(series,utc=True)
+    series = pd.to_datetime(series)
     if CONF.tz:
-        series = series.dt.tz_convert(CONF.tz)
+        series = series.dt.tz_localize(CONF.tz)
     return series
 
 # Google reference functions
@@ -73,7 +114,16 @@ def GoogleOAuth():
     # If there are no (valid) credentials available, let the user log in.
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                # Catch token expiration for dev projects and just log in again
+                del localConfigR['GoogleAPI']['token']
+                credentials = localConfigR['GoogleAPI']['credentials']
+                flow = InstalledAppFlow.from_client_config(
+                credentials, SCOPES
+                )
+                creds = flow.run_local_server(port=0)
         else:
             credentials = localConfigR['GoogleAPI']['credentials']
             flow = InstalledAppFlow.from_client_config(
