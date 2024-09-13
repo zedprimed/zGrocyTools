@@ -1,7 +1,10 @@
 import requests
 import json
 import os
+import csv
 import pandas as pd
+import re
+import logging
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -12,19 +15,74 @@ from google.auth.exceptions import RefreshError
 
 import google.auth
 
+# Set up logging object with local data
+def start_logger(suffix,level):
+    logging.basicConfig(
+        filename=f"..\\Jupyter\\Logs\\{suffix}.log",
+        encoding="utf-8",
+        filemode="a",
+        format="{asctime} - {levelname} - {message}",
+        style="{",
+        datefmt="%Y-%m-%d %H:%M",
+        level=eval(f'logging.{level}')
+    )
+    return logging
+
+
+
 # Create class for global config
 class GrConf:
-    def __init__(self,file='localEnv.json'):
+    def __init__(self,file='localEnv.json',ddic='ddic.csv'):
         env=open(file,'r')
         config=json.load(env)
         env.close()
-        #class decs
+        with open(ddic,'r') as infile:
+            reader = csv.DictReader(infile)
+            self.dataDic = list(reader)
+        
+        #unpack JSON to readable class 
         self.apikey = config['LocalUser']['APIKey']
         self.entrypoint = config['LocalUser']['URL Root']
         self.interface = config['Interface']
         self.tz = config['LocalUser']['Timezone']
         global CONF
         CONF = self
+        logging.info('Config (re)loaded')
+    def explainfield(self,field):
+        # Gives the data dictionary result in list format if it exists or error string if it does not
+        for x in self.dataDic:
+            if field == x['field']:
+                return x
+        return 'Not Found'
+    def build_alias(self,APIresult):
+        # Builds a dictionary of field aliases to apply
+        
+        alias={}
+        for x in APIresult[0]:
+            aliasListing=[]
+            fieldDef = self.explainfield(x)
+            try: 
+                if fieldDef['aliasObj']:
+                    iterCaller = GrGetAPI('Objects',fieldDef['aliasObj'])
+                    if fieldDef['aliasParam']:
+                        iterCaller.buildParam(fieldDef['aliasParam'])
+                    iterCaller.get()
+                    if "200" not in str(iterCaller.r):
+                        print(r+' API failure')
+                        continue
+                    #Build a dictionary of aliases to apply in dataframes with boolean loc
+                    aliasPull=iterCaller.r.json()        
+                    for y in aliasPull:
+                        aliasListing.append({y['id']:y[fieldDef['aliasObjField']]})
+                    alias[x]=aliasListing
+            except TypeError:
+                continue
+        if alias:
+            return alias
+        else:
+            print("No aliasing found for these results")
+
+
 
 # Create class for Get API calls
 class GrGetAPI:
@@ -88,6 +146,89 @@ class GrPostAPI:
 
     def post(self):
         self.r = requests.post(self.endpoint,headers=self.headers,json=self.body)
+
+#A1 notation converter adapted from gspread
+def rowcol_to_a1(row: int, col: int):
+    """Translates a row and column cell address to A1 notation.
+
+    :param row: The row of the cell to be converted.
+        Rows start at index 1.
+    :type row: int, str
+
+    :param col: The column of the cell to be converted.
+        Columns start at index 1.
+    :type row: int, str
+
+    :returns: a string containing the cell's coordinates in A1 notation.
+
+    Example:
+
+    >>> rowcol_to_a1(1, 1)
+    A1
+
+    """
+    if row < 1 or col < 1:
+        raise IncorrectCellLabel("({}, {})".format(row, col))
+
+    div = col
+    column_label = ""
+
+    while div:
+        (div, mod) = divmod(div, 26)
+        if mod == 0:
+            mod = 26
+            div -= 1
+        column_label = chr(mod + 64) + column_label
+
+    label = "{}{}".format(column_label, row)
+
+    return label
+
+#A1 notation converter adapated from gspread
+
+def a1_to_rowcol(label: str):
+    """Translates a cell's address in A1 notation to a tuple of integers.
+
+    :param str label: A cell label in A1 notation, e.g. 'B1'.
+        Letter case is ignored.
+    :returns: a tuple containing `row` and `column` numbers. Both indexed
+              from 1 (one).
+    :rtype: tuple
+
+    Example:
+
+    >>> a1_to_rowcol('A1')
+    (1, 1)
+
+    """
+    CELL_ADDR_RE = re.compile(r"([A-Za-z]+)([1-9]\d*)")
+    m = CELL_ADDR_RE.match(label)
+    if m:
+        column_label = m.group(1).upper()
+        row = int(m.group(2))
+
+        col = 0
+        for i, c in enumerate(reversed(column_label)):
+            col += (ord(c) - 64) * (26**i)
+    else:
+        raise IncorrectCellLabel(label)
+
+    return (row, col)
+
+# use a1 utilities to find a corner bound from a start A1 and a data set
+def a1_from_table(startA1,data):
+    # Get width and height
+    width = 0
+    for x in data:
+        if len(x) > width:
+            width = len(x)
+    height = len(data)
+    # Get numerical row and column, add data dimensions, and convert back to A1
+    row,column = a1_to_rowcol(startA1)
+    row = row + height - 1
+    column = column + width - 1
+    converted = rowcol_to_a1(row,column)
+    return converted
 
 # Create a function for timezone handling of pandas series
 # Localize a series into default timezone
@@ -157,10 +298,10 @@ def create(title,creds):
                 .create(body=spreadsheet, fields="spreadsheetId")
                 .execute()
         )
-        print(f"Spreadsheet ID: {(spreadsheet.get('spreadsheetId'))}")
+        logging.info(f"Spreadsheet ID: {(spreadsheet.get('spreadsheetId'))}")
         return spreadsheet.get("spreadsheetId")
     except HttpError as error:
-        print(f"An error occurred: {error}")
+        logging.error(f"An error occurred: {error}")
         return error
     if __name__ == "__main__":
             # Pass: title
@@ -186,15 +327,15 @@ def spreadsheet_get(creds,spreadsheet_id, range_name=''):
                 .execute()
         )
         rows = result.get("values", [])
-        print(f"{len(rows)} rows retrieved")
+        logging.info(f"{len(rows)} rows retrieved")
         return result
     except HttpError as error:
-        print(f"An error occurred: {error}")
+        logging.error(f"An error occurred: {error}")
         return error
 
 
 #Update a sheet
-# sheets_batch_update - utilizes batching functionality to limit API calls. Not sure I'll need it?
+
 # sheets_append - simply appends a list to the requested sheet
 
 def sheets_append(creds,spreadsheet_id,sheetname,data):
@@ -210,6 +351,27 @@ def sheets_append(creds,spreadsheet_id,sheetname,data):
                             'values': data,
                             })
                 .execute()
+    )
+    return response
+
+def sheets_update(creds,spreadsheet_id,sheetname,shRange,data):
+    service = build("sheets", "v4", credentials=creds)
+    response = (
+        service.spreadsheets()
+        .values()
+        .batchUpdate(
+            spreadsheetId = spreadsheet_id,
+            body = { # The request for updating more than one range of values in a spreadsheet.
+                "valueInputOption": "USER_ENTERED", # How the input data should be interpreted.
+                "data": [ # The new values to apply to the spreadsheet.
+                  { # Data within a range of the spreadsheet.
+                    "range": f'{sheetname}!{shRange}', 
+                    "values": data,
+                    "majorDimension": "ROWS",
+                  },
+                ],
+              }
+        ).execute()
     )
     return response
 
@@ -307,9 +469,10 @@ class GoBatchUpdate:
             service = build("sheets", "v4", credentials=creds)
             if not len(requests) > 0:
                 print('No ops to do?!')
+                logging.critical("Passed noop to batch handler")
                 return 'Noop'
             body = {"requests": requests}
-            print(body)
+            #print(body)
             response = (
                     service.spreadsheets()
                     .batchUpdate(spreadsheetId=spreadsheet_id, body=body)
