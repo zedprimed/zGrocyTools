@@ -5,6 +5,7 @@ import csv
 import pandas as pd
 import re
 import logging
+from datetime import date, timedelta
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -18,10 +19,10 @@ import google.auth
 # Set up logging object with local data
 def start_logger(suffix,level):
     logging.basicConfig(
-        filename=f"..\\Jupyter\\Logs\\{suffix}.log",
+        filename=f"..\\Jupyter\\Logs\\{suffix}_log.csv",
         encoding="utf-8",
         filemode="a",
-        format="{asctime} - {levelname} - {message}",
+        format="{asctime},{name},{levelname},{message}",
         style="{",
         datefmt="%Y-%m-%d %H:%M",
         level=eval(f'logging.{level}')
@@ -33,18 +34,20 @@ def start_logger(suffix,level):
 # Create class for global config
 class GrConf:
     def __init__(self,file='localEnv.json',ddic='ddic.csv'):
-        env=open(file,'r')
+        env=open(file,'r',encoding='utf-8')
         config=json.load(env)
         env.close()
         with open(ddic,'r') as infile:
             reader = csv.DictReader(infile)
             self.dataDic = list(reader)
         
-        #unpack JSON to readable class 
+        #shortcut JSON to readable class values
         self.apikey = config['LocalUser']['APIKey']
         self.entrypoint = config['LocalUser']['URL Root']
         self.interface = config['Interface']
         self.tz = config['LocalUser']['Timezone']
+        self.styleguide=config['GoogleAPI']['styleguide']
+        self.sheets=config['GoogleAPI']['Sheets']
         global CONF
         CONF = self
         logging.info('Config (re)loaded')
@@ -55,8 +58,7 @@ class GrConf:
                 return x
         return 'Not Found'
     def build_alias(self,APIresult):
-        # Builds a dictionary of field aliases to apply
-        
+        # Builds a dictionary of field aliases to apply        
         alias={}
         for x in APIresult[0]:
             aliasListing=[]
@@ -82,7 +84,28 @@ class GrConf:
         else:
             print("No aliasing found for these results")
 
+    def list_uneditable(self):
+        #Returns a list of uneditable fields
+        notEditable = []
+        for entry in self.dataDic:
+                if entry['notEditable'] == 'True':
+                    notEditable.append(entry['field'])
+        return notEditable
 
+    def read_config(self,area):
+        try:
+            return self.__dict__[area]
+        except KeyError:
+            logging.warning(f'no config found for{area}')
+            return "No values found"
+
+# Create dict class for style guide data objects
+class GrStyleGuide:
+    def __init__(self,stylebook,style,file='localEnv.json'):
+        env=open(file,'r',encoding='utf-8')
+        config=json.load(env)
+        env.close()
+        self.guide=config['GoogleAPI']['styleguide'][stylebook][style]
 
 # Create class for Get API calls
 class GrGetAPI:
@@ -96,10 +119,12 @@ class GrGetAPI:
         self.params = {}
         self.r = 0
         self.reference = CONF.interface[category][obj]
-    def buildParam(self,*query):
-        for x in query:
-            #param is in Grocy query statements (str)
-            self.params['query[]'] = x
+    def buildParam(self,query):
+        #query is a list of Grocy query statements (str)
+        #compatibility with an old way: if the value is not a list, listify it
+        if not isinstance(query, list):
+            query = [query]
+        self.params['query[]']=query
     def buildFreeParam(self,param):
         #param is in request Dict
         self.params.update(param)
@@ -146,7 +171,56 @@ class GrPostAPI:
 
     def post(self):
         self.r = requests.post(self.endpoint,headers=self.headers,json=self.body)
+#Dataframe operations to apply rowwise
+def gr_sales_unit_convert(row,product_def):
+    #if a bad product ID, leave
+    if pd.isna(row['product_id']): return row
+    #check if sales unit is different than base unit and make a conversion if so
+    if product_def['product_id'][row['product_id']]['qu_id_purchase'] == product_def['product_id'][row['product_id']]['qu_id_stock']:
+        return row
 
+    uom_check = GrGetAPI('Objects','quantity_unit_conversions')
+    query = [
+        f'from_qu_id={product_def['product_id'][row['product_id']]['qu_id_purchase']}',
+        f'to_qu_id={product_def['product_id'][row['product_id']]['qu_id_stock']}',
+        f'product_id={row['product_id']}'
+        ]
+    uom_check.buildParam(query)
+    uom_check.get()
+    conversion = uom_check.r.json()
+    if len(conversion) != 1: raise ValueError(f'Inconsistent conversion returned for product:{row['product_id']}; id_purchase: {row['qu_id_purchase']}; id_stock: {row['qu_id_stock']}')
+    row['amount'] = float(row['amount']) * float(conversion[0]['factor'])
+    #log that a quantity was converted
+    row['log'] = row['log'] + f'Conversion: quantity was converted by a factor of {conversion[0]['factor']} from {product_def['quantity_units'][product_def['product_id'][row['product_id']]['qu_id_purchase']]['name']} to {product_def['quantity_units'][product_def['product_id'][row['product_id']]['qu_id_stock']]['name']}'
+    return row
+
+def validate_purchase(row,md_cache):
+    #complete boolean evaluations
+    #line is not marked ready - log it and return
+    if row['Ready'] == "":
+        row['error'] = True
+        row['log'] = row['log'] + "Not ready (no other evals run)"
+        return row
+    #product ID NaN
+    if pd.isna(row['product_id']):
+        row['error'] = True
+        row['log'] = row['log'] + "Error: product ID not found (no other evals run)"
+        return row
+    #amount validation
+    if row['amount'] == '':
+        row['error'] = True
+        row['log'] = row['log'] + "Error: no quantity,"
+    if row['best_before_date'] == '':
+        life = md_cache['product_id'][row['product_id']]['default_best_before_days']
+        if life == 0:
+            row['caution'] = True
+        predBBD = days_from_now(life)
+        row['log'] = row['log'] + f'Predicted BBD: {str(predBBD)},'
+    if pd.isna(row['location_id']):
+        pred_loc = md_cache['product_id'][row['product_id']]['location_id']
+        pred_loc = md_cache['location_id'][pred_loc]['name']
+        row['log'] = row['log'] + f'Predicted Location: {str(pred_loc)},'
+    return row
 #A1 notation converter adapted from gspread
 def rowcol_to_a1(row: int, col: int):
     """Translates a row and column cell address to A1 notation.
@@ -237,6 +311,29 @@ def tz(series):
     if CONF.tz:
         series = series.dt.tz_localize(CONF.tz)
     return series
+
+#Function for time deltas ex. BBD prediction
+def days_from_now(n):
+    return date.today() + timedelta(days=n)
+
+#Turn comma separated values in a list into more list
+def csv_extend(target,delimiter=','):
+    new_list = []
+    for entry in target:
+        try:
+            if delimiter in entry:
+                new_list.extend(entry.split(delimiter))
+            else: new_list.append(entry)
+        except TypeError: new_list.append(entry)
+    return new_list
+
+# apply csv_extend to list of list table data
+def table_csv_extend(target,delimiter=','):
+    newTable = []
+    for line in target:
+        line = csv_extend(line,delimiter)
+        newTable.append(line)
+    return newTable
 
 # Google reference functions
 #Oauth
@@ -338,14 +435,14 @@ def spreadsheet_get(creds,spreadsheet_id, range_name=''):
 
 # sheets_append - simply appends a list to the requested sheet
 
-def sheets_append(creds,spreadsheet_id,sheetname,data):
+def sheets_append(creds,spreadsheet_id,sheetname,data,origin):
     service = build("sheets", "v4", credentials=creds)
     response = (
                 service.spreadsheets()
                 .values()
                 .append(
                     spreadsheetId = spreadsheet_id,
-                    range=f'{sheetname}!A1',
+                    range=f'{sheetname}!{origin}',
                     valueInputOption="USER_ENTERED",
                     body = {
                             'values': data,
@@ -373,6 +470,18 @@ def sheets_update(creds,spreadsheet_id,sheetname,shRange,data):
               }
         ).execute()
     )
+    return response
+
+def sheets_clear(creds,spreadsheet_id,sheetname,shRange):
+    service = build("sheets", "v4", credentials=creds)
+    response = (
+        service.spreadsheets()
+        .values()
+        .clear(
+            spreadsheetId = spreadsheet_id,
+            range = f'{sheetname}!{shRange}'
+            )
+        ).execute()
     return response
 
 '''

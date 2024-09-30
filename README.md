@@ -49,5 +49,4 @@ If you are not familiar with Google Cloud APIs check out Google's [Get Started](
 You may continue with a test project or promote to production as desired.  
 Now you are ready to run the BootstrapGoogleSheets notebook:
 1. Run each cell in turn to create the basic Spreadsheets, sheets, headers, and data connections
-2. Pull up each sheet in each Spreadsheet to check for data connection errors - you must authorize each in the web UI
-3. (Optional) file these sheets into a folder of choice in Drive.
+2. (Optional) file these sheets into a folder of choice in Drive.
