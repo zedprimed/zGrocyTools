@@ -48,6 +48,7 @@ class GrConf:
         self.tz = config['LocalUser']['Timezone']
         self.styleguide=config['GoogleAPI']['styleguide']
         self.sheets=config['GoogleAPI']['Sheets']
+        self.CONF=config
         global CONF
         CONF = self
         logging.info('Config (re)loaded')
@@ -57,6 +58,14 @@ class GrConf:
             if field == x['field']:
                 return x
         return 'Not Found'
+    def build_bools(self,APIresult):
+        #Returns a list of hard type bool fields
+        bools = []
+        for column in APIresult[0]:
+            entry = self.explainfield(column)
+            if entry != "Not Found" and entry['PyTypes'] == 'boolean' and entry['Import Hard Type'] == 'True':
+                bools.append(entry['field'])
+        return bools        
     def build_alias(self,APIresult):
         # Builds a dictionary of field aliases to apply        
         alias={}
@@ -98,6 +107,95 @@ class GrConf:
         except KeyError:
             logging.warning(f'no config found for{area}')
             return "No values found"
+    def cache_header_values(self,target,ordering=True):
+        alias_dict = {}
+        md_cache = {}
+        headerdef = {}
+        i=0
+        for field in target.keys():
+            #slice ordering data out if ordering is indicated
+            if ordering:
+                try:
+                    order = int(field[:2])
+                except ValueError:
+                    order = 'tech'
+                field = field[2:]
+                headerdef[field] = order
+            else:
+                field = field
+                order = i
+                i += 1
+                headerdef[field] = order
+            fieldDefinition = CONF.explainfield(field)
+            #handling for undefiend custom fields
+            try:
+                if fieldDefinition['aliasObj'] != "":
+                    iterCaller = GrGetAPI('Objects',fieldDefinition['aliasObj'])
+                    iterCaller.buildParam("active=1")
+                    iterCaller.get()
+                    if "200" not in str(iterCaller.r):
+                        logging.error(iterCaller.r+' API failure')
+                        raise RuntimeError(iterCaller.r)
+                    #summarize human alias for IDs in a dict
+                    alias = {}
+                    for objects in iterCaller.r.json():
+                        alias[objects['id']] = objects['name']
+                    alias_dict[field]=alias
+                    #master data cache just in case
+                    mdresult = iterCaller.r.json()
+                    idresult = {}
+                    for result in mdresult:
+                        index = result.pop('id')
+                        idresult[index]=result
+                    md_cache[field] = idresult
+                if fieldDefinition['PyTypes'] == "boolean":
+                    #human aliases are True and False
+                    alias = {1: True,0: False}
+                    alias_dict[field]=alias
+            except:
+                pass
+        return alias_dict,md_cache,headerdef
+
+def refresh_activate_sheet(creds,spreadsheetId,sheetId,alias_dict,headerdef,logger=None):
+    updater = GoBatchUpdate(creds,spreadsheetId)
+    #add input help to columns with alias
+    for field in alias_dict:
+        #extract the possible values out of the thing
+        validater = list(alias_dict[field].values())
+        validater.sort()
+        #initialize a request dict
+        request = gr_style_template('request_styles','one_of_list_validation')
+        #set the range
+        chRange = request['setDataValidation']['range']
+        chRange['startColumnIndex'] = int(headerdef[field])-1
+        chRange['endColumnIndex'] = int(headerdef[field])
+        chRange['startRowIndex'] = 2
+        chRange['endRowIndex'] = CONF.CONF['LocalUser']['Max Rows to Format']
+        chRange['sheetId'] = sheetId
+        #set the values
+        allowvalues = []
+        for option in validater:
+            valueObj = {"userEnteredValue":option}
+            allowvalues.append(valueObj)
+        request['setDataValidation']['rule']['condition']['values'] = allowvalues
+        #set the message
+        request['setDataValidation']['rule']['inputMessage'] = 'Master Data Based Entry'
+        #Prepare an API update
+        updater.addReq(request)
+        
+    #add request to bring the sheet forward
+    request = {"updateSheetProperties": {
+            "properties": {
+                "sheetId": sheetId,
+                "index":0
+            },
+            "fields": "index"
+    }
+              }
+    updater.addReq(request)
+    updater.call()
+    if logger:
+        logger.info(updater.r)    
 
 # Create dict class for style guide data objects
 class GrStyleGuide:
@@ -106,6 +204,13 @@ class GrStyleGuide:
         config=json.load(env)
         env.close()
         self.guide=config['GoogleAPI']['styleguide'][stylebook][style]
+# umm that being a class is currently ridiculous. Method here instead makes more sense
+def gr_style_template(stylebook,style,file='localEnv.json'):
+    fh=open(file,"r")
+    config = json.load(fh)
+    guide = config['GoogleAPI']['styleguide'][stylebook][style]
+    fh.close()
+    return guide
 
 # Create class for Get API calls
 class GrGetAPI:
