@@ -15,9 +15,15 @@ from googleapiclient.errors import HttpError
 from google.auth.exceptions import RefreshError
 
 import google.auth
+##globals
+CONFIGREGEX = r"\./.+?\./"
 
+## Utilities
 # Set up logging object with local data
 def start_logger(suffix,level):
+    '''
+    Shortcut to starting a logger with the given name at the given level
+    '''
     logging.basicConfig(
         filename=f"..\\Jupyter\\Logs\\{suffix}_log.csv",
         encoding="utf-8",
@@ -28,19 +34,41 @@ def start_logger(suffix,level):
         level=eval(f'logging.{level}')
     )
     return logging
-
-
-
+def parse_gr_symbols(match):
+    '''
+    Regex replacement function for certain symbols
+    '''
+    #case each defined symbol
+    if match.group() == "./env./":
+        replace = CONF.CONF['LocalUser']['Environment']
+    elif match.group() == "./ipynb./":
+        try:
+            replace = NOTEBOOK_NAME
+        except:
+            replace = "Unknown Notebook"
+    else:
+        raise ValueError(f"Unexpected token: {match.group()}")
+    return replace
+    
+##Gr config and interfaces
 # Create class for global config
 class GrConf:
-    def __init__(self,file='localEnv.json',ddic='ddic.csv'):
+    '''
+    A helper class for the module
+    loads the config file
+    serves as an injection point for any notebook context needed in module
+    A number of helper functions
+    '''
+    def __init__(self,notebook_name="Unknown Notebook",file='localEnv.json',ddic='ddic.csv'):
         env=open(file,'r',encoding='utf-8')
         config=json.load(env)
         env.close()
         with open(ddic,'r') as infile:
             reader = csv.DictReader(infile)
             self.dataDic = list(reader)
-        
+        #Inject a notebook name manually into global module context
+        global NOTEBOOK_NAME
+        NOTEBOOK_NAME = notebook_name
         #shortcut JSON to readable class values
         self.apikey = config['LocalUser']['APIKey']
         self.entrypoint = config['LocalUser']['URL Root']
@@ -53,13 +81,18 @@ class GrConf:
         CONF = self
         logging.info('Config (re)loaded')
     def explainfield(self,field):
-        # Gives the data dictionary result in list format if it exists or error string if it does not
+        ''' 
+        Gives the data dictionary result in list format if it exists 
+        or None if it does not
+        '''
         for x in self.dataDic:
             if field == x['field']:
                 return x
-        return 'Not Found'
+        return None
     def build_bools(self,APIresult):
-        #Returns a list of hard type bool fields
+        '''
+        Returns a list of hard type bool fields
+        '''
         bools = []
         for column in APIresult[0]:
             entry = self.explainfield(column)
@@ -67,7 +100,10 @@ class GrConf:
                 bools.append(entry['field'])
         return bools        
     def build_alias(self,APIresult):
-        # Builds a dictionary of field aliases to apply        
+        '''
+        Builds a dictionary of field aliases to apply
+        Takes a Grocy Get result and builds a dictionary of ID to Name/Description results
+        '''
         alias={}
         for x in APIresult[0]:
             aliasListing=[]
@@ -91,10 +127,12 @@ class GrConf:
         if alias:
             return alias
         else:
-            print("No aliasing found for these results")
+            raise ValueError("No aliasing found - is this a useful APIresult?")
 
     def list_uneditable(self):
-        #Returns a list of uneditable fields
+        '''
+        Returns a list of uneditable fields
+        '''
         notEditable = []
         for entry in self.dataDic:
                 if entry['notEditable'] == 'True':
@@ -102,16 +140,29 @@ class GrConf:
         return notEditable
 
     def read_config(self,area):
+        '''
+        Returns config as a dictionary including replacing symbols with program values
+        Ends up doing a deep copy through json.dumps and loads while parsing symbols
+        '''
         try:
-            return self.__dict__[area]
+            result = self.__dict__[area]
+            text = json.dumps(result)
+            regex = re.sub(CONFIGREGEX,parse_gr_symbols,text)
+            result = json.loads(regex)
+            return result
         except KeyError:
             logging.warning(f'no config found for{area}')
-            return "No values found"
+            return None
     def cache_header_values(self,target,ordering=True):
+        '''
+        With a target data dictionary, calculates a bunch of required dicts
+        for making Google Sheets updates and parsing data to and from Sheets to df
+        and preparing for making Put and Get Grocy API calls
+        '''
         alias_dict = {}
         md_cache = {}
         headerdef = {}
-        i=0
+        i=1
         for field in target.keys():
             #slice ordering data out if ordering is indicated
             if ordering:
@@ -149,14 +200,30 @@ class GrConf:
                         idresult[index]=result
                     md_cache[field] = idresult
                 if fieldDefinition['PyTypes'] == "boolean":
-                    #human aliases are True and False
-                    alias = {1: True,0: False}
+                    #google aliases are TRUE and FALSE
+                    alias = {1: "TRUE",0: "FALSE"}
                     alias_dict[field]=alias
             except:
                 pass
         return alias_dict,md_cache,headerdef
 
+def prep_df_to_upload(df,strNAreplace=True,boolreplace=True):
+    '''
+    Clean up function that gets a df into a list that works with Google Sheets API
+    '''
+    if strNAreplace: df = df.replace("<NA>","")
+    if boolreplace:
+        df = df.replace(True,"True")
+        df = df.replace(False,"False")
+    return df.values.tolist()
+
 def refresh_activate_sheet(creds,spreadsheetId,sheetId,alias_dict,headerdef,logger=None):
+    '''
+    Google API batch updates for:
+    Refresh validation with latest Grocy data
+    Move sheet to front of Google Spreadsheet
+    Add a super header based on config
+    '''
     updater = GoBatchUpdate(creds,spreadsheetId)
     #add input help to columns with alias
     for field in alias_dict:
@@ -175,7 +242,7 @@ def refresh_activate_sheet(creds,spreadsheetId,sheetId,alias_dict,headerdef,logg
         #set the values
         allowvalues = []
         for option in validater:
-            valueObj = {"userEnteredValue":option}
+            valueObj = {"userEnteredValue":str(option)}
             allowvalues.append(valueObj)
         request['setDataValidation']['rule']['condition']['values'] = allowvalues
         #set the message
@@ -195,10 +262,28 @@ def refresh_activate_sheet(creds,spreadsheetId,sheetId,alias_dict,headerdef,logg
     updater.addReq(request)
     updater.call()
     if logger:
-        logger.info(updater.r)    
+        logger.info(updater.r)
+    #Update the header with any utility values in config
+    try:
+        data = [gr_style_template("value_styles","default_header",file='localEnv.json')]
+        for spreadsheet in CONF.sheets:
+            if CONF.sheets[spreadsheet]['spreadsheetId'] == spreadsheetId:
+                for sheet in CONF.sheets[spreadsheet]['sheets']:
+                    if CONF.sheets[spreadsheet]['sheets'][sheet] == sheetId:
+                        sheetname = sheet
+        origin = 'A1'
+        end = a1_from_table(origin,data)
+        shRange = f'{origin}:{end}'
+        sheets_update(creds,spreadsheetId,sheetname,shRange,data)
+    except KeyError:
+        if logger:
+            logger.info("No header values configured")
 
-# Create dict class for style guide data objects
 class GrStyleGuide:
+    '''
+    deprecated, left for compatibility for now
+    Create dict class for style guide data objects
+    '''
     def __init__(self,stylebook,style,file='localEnv.json'):
         env=open(file,'r',encoding='utf-8')
         config=json.load(env)
@@ -206,36 +291,54 @@ class GrStyleGuide:
         self.guide=config['GoogleAPI']['styleguide'][stylebook][style]
 # umm that being a class is currently ridiculous. Method here instead makes more sense
 def gr_style_template(stylebook,style,file='localEnv.json'):
+    '''
+    Loads a specific style direct from config file
+    A shortcut compared to using CONF as we definitely need a deep copy
+    but only need a very specific piece of config.
+    '''
     fh=open(file,"r")
-    config = json.load(fh)
+    strconfig = fh.read()
+    result = re.sub(CONFIGREGEX,parse_gr_symbols,strconfig)
+    config = json.loads(result)
     guide = config['GoogleAPI']['styleguide'][stylebook][style]
     fh.close()
     return guide
 
-# Create class for Get API calls
 class GrGetAPI:
+    '''
+    Object to manage Get API calls to Grocy
+    '''
     def __init__(self,category,obj):
         self.origEndpoint = CONF.entrypoint+CONF.interface[category][obj]['path']
         self.endpoint = self.origEndpoint #assume generally object gets until told otherwise by buildTx
         self.key = CONF.apikey
         self.headers = {
             "accept": "application/json",
-            "GROCY-API-KEY": self.key} # What headers for Put or Post?
+            "GROCY-API-KEY": self.key}
         self.params = {}
-        self.r = 0
+        self.r = None
         self.reference = CONF.interface[category][obj]
     def buildParam(self,query):
-        #query is a list of Grocy query statements (str)
+        '''
+        Build the Grocy query[] based queries which is a little different than the rest of
+        a REST query i.e. str based statements and not dict
+        query is a list of Grocy query statements (str)
+        '''
         #compatibility with an old way: if the value is not a list, listify it
         if not isinstance(query, list):
             query = [query]
         self.params['query[]']=query
     def buildFreeParam(self,param):
-        #param is in request Dict
+        '''
+        Build the normal REST queries which are in standard dict format
+        param is in request Dict
+        '''
         self.params.update(param)
 
     def buildTx(self,target,tx):
-        #simpler Tx builder for the Tx type gets
+        '''
+        simpler Tx builder for the Tx type gets
+        '''
         if 'txType' in self.reference and (tx=="" or target==""):
             print("Not enough info for this type of post")
         elif 'txType' in self.reference:
@@ -245,6 +348,10 @@ class GrGetAPI:
         self.body = body
         
     def get(self):
+        '''
+        Executes the HTML request as a GET call using the URL, headers, and parameters
+        built through other methods
+        '''
         if bool(self.reference['get']):
             self.r = requests.get(self.endpoint,headers=self.headers,params=self.params)
         else:
@@ -252,6 +359,9 @@ class GrGetAPI:
 
 # Create class for Post API calls
 class GrPostAPI:
+    '''
+    Object to manage POST API calls to Grocy
+    '''
     def __init__(self,category,obj):
         self.key = CONF.apikey
         self.headers = {
@@ -264,6 +374,9 @@ class GrPostAPI:
         self.origEndpoint = CONF.entrypoint+CONF.interface[category][obj]['path']
         self.reference = CONF.interface[category][obj]
     def buildTx(self,body,target="",tx=""):
+        '''
+        Build a transaction using a dict body, the target ID, and the Grocy transaction code
+        '''
         if 'txType' in self.reference and (tx=="" or target==""):
             print("Not enough info for this type of post")
             #del the endpoint to stop from trying to post a malformed call after an earlier one that worked
@@ -275,15 +388,20 @@ class GrPostAPI:
         self.body = body
 
     def post(self):
+        '''
+        Excecute the call as an HTML POST request
+        '''
         self.r = requests.post(self.endpoint,headers=self.headers,json=self.body)
-#Dataframe operations to apply rowwise
+## Dataframe operations to apply rowwise
 def gr_sales_unit_convert(row,product_def):
+    '''
+    Convert the entered quantity assuming it is a sales unit into the stocktaking unit
+    '''
     #if a bad product ID, leave
     if pd.isna(row['product_id']): return row
     #check if sales unit is different than base unit and make a conversion if so
     if product_def['product_id'][row['product_id']]['qu_id_purchase'] == product_def['product_id'][row['product_id']]['qu_id_stock']:
         return row
-
     uom_check = GrGetAPI('Objects','quantity_unit_conversions')
     query = [
         f'from_qu_id={product_def['product_id'][row['product_id']]['qu_id_purchase']}',
@@ -300,7 +418,9 @@ def gr_sales_unit_convert(row,product_def):
     return row
 
 def validate_purchase(row,md_cache):
-    #complete boolean evaluations
+    '''
+    complete boolean evaluations on each row of a purchase DF to prepare for posting
+    '''
     #line is not marked ready - log it and return
     if row['Ready'] == "":
         row['error'] = True
@@ -394,8 +514,11 @@ def a1_to_rowcol(label: str):
 
     return (row, col)
 
-# use a1 utilities to find a corner bound from a start A1 and a data set
+
 def a1_from_table(startA1,data):
+    '''
+    use a1 utilities to find a corner bound from a start A1 and a data set
+    '''
     # Get width and height
     width = 0
     for x in data:
@@ -409,20 +532,29 @@ def a1_from_table(startA1,data):
     converted = rowcol_to_a1(row,column)
     return converted
 
-# Create a function for timezone handling of pandas series
-# Localize a series into default timezone
+
 def tz(series):
+    '''
+    Deprecated - in case your Grocy is in UTC this can help
+    Create a function for timezone handling of pandas series
+    Localize a series into default timezone
+    '''
     series = pd.to_datetime(series)
     if CONF.tz:
         series = series.dt.tz_localize(CONF.tz)
     return series
 
-#Function for time deltas ex. BBD prediction
+
 def days_from_now(n):
+    '''
+    Function for time deltas ex. BBD prediction
+    '''
     return date.today() + timedelta(days=n)
 
-#Turn comma separated values in a list into more list
 def csv_extend(target,delimiter=','):
+    '''
+    Turn comma separated values in a list into more list
+    '''
     new_list = []
     for entry in target:
         try:
@@ -432,18 +564,22 @@ def csv_extend(target,delimiter=','):
         except TypeError: new_list.append(entry)
     return new_list
 
-# apply csv_extend to list of list table data
+
 def table_csv_extend(target,delimiter=','):
+    '''
+    apply csv_extend to list of list table data
+    '''
     newTable = []
     for line in target:
         line = csv_extend(line,delimiter)
         newTable.append(line)
     return newTable
 
-# Google reference functions
-#Oauth
-
+## Google reference functions
 def GoogleOAuth():
+    '''
+    Runs Google OAuth to update tokens in config file
+    '''
     SCOPES = ["https://www.googleapis.com/auth/drive.file",]
     creds = None
     # The file token.json stores the user's access and refresh tokens, and is
@@ -487,11 +623,7 @@ def create(title,creds):
     """
     Creates the Sheet the user has access to.
     Load pre-authorized user credentials from the environment.
-    TODO(developer) - See https://developers.google.com/identity
-    for guides on implementing OAuth2 for the application.
     """
-    #creds, _ = google.auth.default() #turn off ADC for now???
-    # pylint: disable=maybe-no-member
     try:
         service = build("sheets", "v4", credentials=creds)
         spreadsheet = {"properties": {"title": title}}
@@ -514,11 +646,7 @@ def spreadsheet_get(creds,spreadsheet_id, range_name=''):
     """
     Creates the batch_update the user has access to.
     Load pre-authorized user credentials from the environment.
-    TODO(developer) - See https://developers.google.com/identity
-    for guides on implementing OAuth2 for the application.
     """
-    #creds, _ = google.auth.default()
-    # pylint: disable=maybe-no-member
     try:
         service = build("sheets", "v4", credentials=creds)
 
@@ -536,11 +664,14 @@ def spreadsheet_get(creds,spreadsheet_id, range_name=''):
         return error
 
 
-#Update a sheet
 
-# sheets_append - simply appends a list to the requested sheet
+
 
 def sheets_append(creds,spreadsheet_id,sheetname,data,origin):
+    '''
+    simply appends a list of list data to the requested sheet
+    if origin is in a table, Google will start from the bottom of it
+    '''
     service = build("sheets", "v4", credentials=creds)
     response = (
                 service.spreadsheets()
@@ -557,6 +688,11 @@ def sheets_append(creds,spreadsheet_id,sheetname,data,origin):
     return response
 
 def sheets_update(creds,spreadsheet_id,sheetname,shRange,data):
+    '''
+    Updates and overwrites the google sheet with a list of list data
+    As in Google API, requires an explicit sheet range as a check against 
+    what you are overwriting
+    '''
     service = build("sheets", "v4", credentials=creds)
     response = (
         service.spreadsheets()
@@ -578,6 +714,9 @@ def sheets_update(creds,spreadsheet_id,sheetname,shRange,data):
     return response
 
 def sheets_clear(creds,spreadsheet_id,sheetname,shRange):
+    '''
+    Clears the data in the sheet and range provided, leaving formatting
+    '''
     service = build("sheets", "v4", credentials=creds)
     response = (
         service.spreadsheets()
@@ -589,71 +728,20 @@ def sheets_clear(creds,spreadsheet_id,sheetname,shRange):
         ).execute()
     return response
 
-'''
-Leaving this for reference - I've implemented a class handler containing this as a call method to match my other REST calls
-def sheets_batch_update(creds,spreadsheet_id, title='', find='', replacement='', append=''):
-    """
-    Update the sheet details in batch, the user has access to.
-    Load pre-authorized user credentials from the environment.
-    TODO(developer) - See https://developers.google.com/identity
-    for guides on implementing OAuth2 for the application.
-    """
-
-    #creds, _ = google.auth.default()
-    # pylint: disable=maybe-no-member
-
-    try:
-        service = build("sheets", "v4", credentials=creds)
-
-        requests = []
-        # Change the spreadsheet's title.
-        if title != '':
-            requests.append(
-                    {
-                            "updateSpreadsheetProperties": {
-                                    "properties": {"title": title},
-                                    "fields": "title",
-                            }
-                    }
-            )
-        # Find and replace text
-        if find != '' and replacement != '':
-            requests.append(
-                    {
-                            "findReplace": {
-                                    "find": find,
-                                    "replacement": replacement,
-                                    "allSheets": True,
-                            }
-                    }
-            )
-        #Append requests
-        
-        # Add additional requests (operations) ...
-
-
-        if requests == []:
-            print('No ops to do?!')
-            return 'Noop'
-        body = {"requests": requests}
-        response = (
-                service.spreadsheets()
-                .batchUpdate(spreadsheetId=spreadsheet_id, body=body)
-                .execute()
-        )
-        return response
-    except HttpError as error:
-        print(f"An error occurred: {error}")
-        return error
-'''
-
 class GoBatchUpdate:
+    '''
+    An API object for building batch requests and providing them in mass to the Google API
+    '''
     def __init__(self,creds,spreadsheet_id):
         self.creds = creds
         self.spreadsheet_id = spreadsheet_id
         self.requests = []
 
     def addReq(self,req):
+        '''
+        Adds a request
+        A request is a dictionary as a JSON object for the API
+        '''
         self.requests.append(req)
     
     def call(self):
@@ -661,17 +749,7 @@ class GoBatchUpdate:
         Update the sheet details in batch, the user has access to.
         Load pre-authorized user credentials from the environment.
         TODO(developer) - See https://developers.google.com/identity
-        for guides on implementing OAuth2 for the application.
-    
-        requests is a list of JSON requests in dict format 
-        ex.
-        [{
-    "addSheet": {
-        "properties": {
-            "title": "APISHeet"
-            }
-        }
-        }]        
+        for guides on implementing OAuth2 for the application.      
         """
     
         #creds, _ = google.auth.default()
